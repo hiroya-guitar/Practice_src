@@ -1,0 +1,14 @@
+# logs / data
+fret_trainer_logs/
+code_trainer_logs/
+practice_logs/
+analysis_outputs/
+
+# general
+*.csv
+*.log
+*.ipynb
+__pycache__/
+*.pyc
+.env
+.DS_Store
