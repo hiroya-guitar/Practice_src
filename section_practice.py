@@ -3,10 +3,18 @@
 
 """
 反復練習トラッカー（CSV / 曲インデックス管理 / 小節範囲 / BPM提案 / 拍子 / メトロノーム）
+
+ポイント
 - 曲登録時に拍子（例: 4/4）も保存
 - BPM入力時に「試聴メトロノーム（ビープ）」でテンポ確認できる
 - 練習中は常にそのテンポ音（メトロノーム）が鳴る
-- Windows想定：winsound.Beep を使用
+- Windows: winsound.Beep を使用
+- macOS: 周波数指定の短いWAVを自動生成して afplay で再生（Windowsと同じ「1拍目アクセント高音」挙動）
+- Linux: paplay / aplay があれば同様に再生（なければベルにフォールバック）
+
+重要（Segmentation fault 対策）
+- simpleaudio 等のネイティブ拡張は使いません（C拡張クラッシュ回避）。
+- OS標準コマンド（afplay/paplay/aplay）で再生するため、Pythonが落ちにくい構成です。
 
 保存:
 - practice_logs/songs.csv
@@ -20,15 +28,24 @@
 """
 
 import csv
+import math
 import os
+import platform
+import shutil
+import struct
+import subprocess
+import tempfile
 import threading
 import time
 import tkinter as tk
-import winsound
+import wave
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from tkinter import ttk, messagebox
 
+# -----------------------------
+# Config
+# -----------------------------
 LOG_DIR = "practice_logs"
 SONGS_CSV = os.path.join(LOG_DIR, "songs.csv")
 SESSIONS_CSV = os.path.join(LOG_DIR, "sessions.csv")
@@ -51,7 +68,14 @@ SESSIONS_FIELDS = [
     "note",
 ]
 
+OS_NAME = platform.system()
+IS_WINDOWS = (OS_NAME == "Windows")
+IS_MAC = (OS_NAME == "Darwin")
 
+
+# -----------------------------
+# Utilities
+# -----------------------------
 def ensure_log_dir():
     os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -133,7 +157,6 @@ def ensure_songs_schema():
         write_csv_rows(SONGS_CSV, SONGS_FIELDS, [])
         return
 
-    # 現行ヘッダを読み取る
     with open(SONGS_CSV, "r", newline="", encoding="utf-8") as f:
         r = csv.reader(f)
         header = next(r, [])
@@ -143,13 +166,11 @@ def ensure_songs_schema():
 
     rows = read_csv_rows(SONGS_CSV)
 
-    # 行の補完（無ければ 4/4）
     for row in rows:
         if not (row.get("beats_per_bar") or "").strip():
             row["beats_per_bar"] = "4"
         if not (row.get("beat_unit") or "").strip():
             row["beat_unit"] = "4"
-        # song_index/song_name/created_at が欠けていても空のままにする（ユーザーが手修正している可能性）
         if not (row.get("created_at") or "").strip():
             row["created_at"] = now_iso()
 
@@ -164,9 +185,166 @@ def ensure_sessions_schema():
         write_csv_rows(SESSIONS_CSV, SESSIONS_FIELDS, [])
 
 
+# -----------------------------
+# Cross-platform tone (no C-extension)
+# -----------------------------
+class TonePlayer:
+    """
+    OS差を吸収して周波数指定のビープを鳴らす（Segfault回避のためネイティブ拡張は使用しない）。
+
+    - Windows: winsound.Beep(freq, ms)
+    - macOS:   事前生成したWAVを afplay で再生（周波数/長さを一致させる）
+    - Linux:   paplay / aplay があれば再生、無ければベル '\a' にフォールバック
+
+    ※ 再生は「ブロッキング」（winsound.Beepに近い）にしてテンポを安定させる
+    """
+
+    def __init__(self, sample_rate: int = 44100):
+        self.sample_rate = sample_rate
+        self._cache: dict[tuple[int, int], str] = {}
+        self._lock = threading.Lock()
+        self._tmp_files: set[str] = set()
+
+        self._has_afplay = shutil.which("afplay") is not None
+        self._has_paplay = shutil.which("paplay") is not None
+        self._has_aplay = shutil.which("aplay") is not None
+
+        if IS_WINDOWS:
+            try:
+                import winsound  # type: ignore
+                self._winsound = winsound
+            except Exception:
+                self._winsound = None
+        else:
+            self._winsound = None
+
+    def close(self):
+        # 生成したWAVを削除（残しても害は少ないが、一応掃除）
+        with self._lock:
+            files = list(self._tmp_files)
+            self._tmp_files.clear()
+            self._cache.clear()
+        for p in files:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+    def _wav_path(self, freq: int, ms: int) -> str:
+        key = (int(freq), int(ms))
+        with self._lock:
+            p = self._cache.get(key)
+            if p and os.path.exists(p):
+                return p
+
+        # WAV生成（16-bit PCM mono）
+        n_samples = max(1, int(self.sample_rate * (ms / 1000.0)))
+        amplitude = 0.25  # 0.0〜1.0
+
+        fd, path = tempfile.mkstemp(prefix=f"metro_{freq}_{ms}_", suffix=".wav")
+        os.close(fd)
+
+        try:
+            with wave.open(path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(self.sample_rate)
+
+                # ポップノイズ軽減のため、簡単なフェード（2ms程度）
+                fade_ms = 2
+                fade_n = max(1, int(self.sample_rate * (fade_ms / 1000.0)))
+                for i in range(n_samples):
+                    t = i / self.sample_rate
+                    v = math.sin(2.0 * math.pi * float(freq) * t) * amplitude
+
+                    # fade in/out
+                    if i < fade_n:
+                        v *= (i / fade_n)
+                    if (n_samples - 1 - i) < fade_n:
+                        v *= ((n_samples - 1 - i) / fade_n)
+
+                    s = int(v * 32767.0)
+                    wf.writeframes(struct.pack("<h", s))
+        except Exception:
+            # 生成に失敗したら削除してフォールバックへ
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+            raise
+
+        with self._lock:
+            self._cache[key] = path
+            self._tmp_files.add(path)
+        return path
+
+    def _run_cmd_blocking(self, cmd: list[str]):
+        # どんな失敗も「鳴らない」だけにする（例外でアプリを落とさない）
+        try:
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    def beep(self, freq: int, ms: int):
+        freq = int(freq)
+        ms = int(ms)
+        if freq <= 0 or ms <= 0:
+            return
+
+        # Windows winsound
+        if IS_WINDOWS and self._winsound is not None:
+            try:
+                self._winsound.Beep(freq, ms)
+            except Exception:
+                pass
+            return
+
+        # macOS afplay
+        if IS_MAC and self._has_afplay:
+            try:
+                wav_path = self._wav_path(freq, ms)
+                self._run_cmd_blocking(["afplay", wav_path])
+            except Exception:
+                # フォールバック
+                try:
+                    print("\a", end="", flush=True)
+                except Exception:
+                    pass
+            return
+
+        # Linux / other: paplay / aplay
+        try:
+            wav_path = self._wav_path(freq, ms)
+        except Exception:
+            wav_path = ""
+
+        if wav_path:
+            if self._has_paplay:
+                self._run_cmd_blocking(["paplay", wav_path])
+                return
+            if self._has_aplay:
+                self._run_cmd_blocking(["aplay", "-q", wav_path])
+                return
+
+        # 最後のフォールバック（ベル）
+        try:
+            print("\a", end="", flush=True)
+            # ベルは短すぎることがあるので、msぶん軽く待つ（テンポ維持）
+            time.sleep(ms / 1000.0)
+        except Exception:
+            pass
+
+
 class BeepMetronome:
     """
-    winsound.Beep を使った簡易メトロノーム。
+    クロスプラットフォームの簡易メトロノーム。
     - 1拍目（小節頭）は高い音、他は低い音
     - start/stop でスレッド制御
     """
@@ -181,6 +359,18 @@ class BeepMetronome:
         self.freq_accent = 1100
         self.freq_normal = 800
         self.beep_ms = 30
+
+        self._player = TonePlayer()
+
+    def close(self):
+        try:
+            self.stop()
+        except Exception:
+            pass
+        try:
+            self._player.close()
+        except Exception:
+            pass
 
     def update(self, bpm: int, beats_per_bar: int):
         with self._lock:
@@ -204,28 +394,29 @@ class BeepMetronome:
     def _run(self):
         beat = 0
         next_t = time.perf_counter()
+
         while not self._stop.is_set():
             with self._lock:
                 bpm = self.bpm
                 bpb = self.beats_per_bar
 
             interval = 60.0 / max(1, bpm)
-
             now = time.perf_counter()
+
             if now < next_t:
                 time.sleep(min(0.01, next_t - now))
                 continue
 
             freq = self.freq_accent if (beat % bpb == 0) else self.freq_normal
-            try:
-                winsound.Beep(freq, self.beep_ms)
-            except Exception:
-                pass
+            self._player.beep(freq, self.beep_ms)
 
             beat = (beat + 1) % bpb
             next_t += interval
 
 
+# -----------------------------
+# Data model
+# -----------------------------
 @dataclass
 class SessionRow:
     session_id: str
@@ -242,6 +433,9 @@ class SessionRow:
     note: str
 
 
+# -----------------------------
+# App
+# -----------------------------
 class PracticeTracker(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -285,6 +479,25 @@ class PracticeTracker(tk.Tk):
         self.refresh_song_list()
         self._set_idle_state()
         self._update_suggestion()
+
+        # 初回に、OSと音のバックエンド情報をログに出す（落ちない）
+        self.after(200, self._log_audio_backend_info)
+
+    def _log_audio_backend_info(self):
+        if IS_WINDOWS:
+            self.log_append("\n[Audio] Windows: winsound.Beep\n")
+        elif IS_MAC:
+            if shutil.which("afplay"):
+                self.log_append("\n[Audio] macOS: afplay + generated WAV (freq-based)\n")
+            else:
+                self.log_append("\n[Audio] macOS: afplay not found -> terminal bell fallback\n")
+        else:
+            if shutil.which("paplay"):
+                self.log_append("\n[Audio] Linux/Other: paplay + generated WAV (freq-based)\n")
+            elif shutil.which("aplay"):
+                self.log_append("\n[Audio] Linux/Other: aplay + generated WAV (freq-based)\n")
+            else:
+                self.log_append("\n[Audio] Linux/Other: no player -> terminal bell fallback\n")
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -332,17 +545,25 @@ class PracticeTracker(tk.Tk):
 
         ttk.Label(add_row, text="新規追加 曲名").pack(side="left")
         self.new_song_name_var = tk.StringVar()
-        ttk.Entry(add_row, textvariable=self.new_song_name_var).pack(side="left", padx=(6, 6), fill="x", expand=True)
+        ttk.Entry(add_row, textvariable=self.new_song_name_var).pack(
+            side="left", padx=(6, 6), fill="x", expand=True
+        )
 
         ttk.Label(add_row, text="拍子").pack(side="left", padx=(10, 0))
         self.new_bpb_var = tk.StringVar(value="4")
         self.new_bu_var = tk.StringVar(value="4")
-        bpb = ttk.Combobox(add_row, textvariable=self.new_bpb_var, width=3,
-                           values=[str(i) for i in range(1, 13)], state="readonly")
+        bpb = ttk.Combobox(
+            add_row,
+            textvariable=self.new_bpb_var,
+            width=3,
+            values=[str(i) for i in range(1, 13)],
+            state="readonly",
+        )
         bpb.pack(side="left", padx=(4, 2))
         ttk.Label(add_row, text="/").pack(side="left")
-        bu = ttk.Combobox(add_row, textvariable=self.new_bu_var, width=3,
-                          values=["2", "4", "8"], state="readonly")
+        bu = ttk.Combobox(
+            add_row, textvariable=self.new_bu_var, width=3, values=["2", "4", "8"], state="readonly"
+        )
         bu.pack(side="left", padx=(2, 6))
 
         ttk.Button(add_row, text="追加", command=self.add_song).pack(side="left")
@@ -472,7 +693,7 @@ class PracticeTracker(tk.Tk):
     def on_close(self):
         # 終了時に必ず止める
         try:
-            self.metro.stop()
+            self.metro.close()
         except Exception:
             pass
         self.destroy()
@@ -556,13 +777,17 @@ class PracticeTracker(tk.Tk):
             return
 
         idx = self.next_song_index()
-        append_csv(SONGS_CSV, SONGS_FIELDS, {
-            "song_index": idx,
-            "song_name": name,
-            "beats_per_bar": bpb,
-            "beat_unit": bu,
-            "created_at": now_iso(),
-        })
+        append_csv(
+            SONGS_CSV,
+            SONGS_FIELDS,
+            {
+                "song_index": idx,
+                "song_name": name,
+                "beats_per_bar": bpb,
+                "beat_unit": bu,
+                "created_at": now_iso(),
+            },
+        )
 
         self.new_song_name_var.set("")
         self.refresh_song_list()
@@ -865,7 +1090,6 @@ class PracticeTracker(tk.Tk):
 
         self._update_counter_labels()
 
-        # 練習が終わったら、試聴ボタンは「停止状態」表示に寄せる
         if not self.metro.is_running():
             self.preview_btn.configure(text="試聴 ▶")
 
@@ -927,7 +1151,6 @@ class PracticeTracker(tk.Tk):
             messagebox.showerror("開始できません", str(e))
             return
 
-        # もし試聴が鳴っていたら、練習用にそのまま使う（停止せず update だけ）
         bpb = int(getattr(self, "selected_beats_per_bar", 4) or 4)
 
         self.session_id = new_session_id()
@@ -950,7 +1173,7 @@ class PracticeTracker(tk.Tk):
         else:
             self.metro.start(bpm=bpm, beats_per_bar=bpb)
 
-        self.preview_btn.configure(text="試聴 ■")  # 実際は練習中も鳴っているので「停止」表示
+        self.preview_btn.configure(text="試聴 ■")
 
         self.log_append(
             f"\n=== 開始 [{self.session_id}] 曲=[{self.selected_song_index}] {self.selected_song_name} "
@@ -963,7 +1186,6 @@ class PracticeTracker(tk.Tk):
 
         self.log_append(f"=== 中断（保存しない） session_id={self.session_id} ===\n")
 
-        # 練習中メトロノーム停止
         self.metro.stop()
         self.preview_btn.configure(text="試聴 ▶")
 
@@ -989,11 +1211,11 @@ class PracticeTracker(tk.Tk):
         self.success = min(self.success, self.reps)
 
         t_end_iso = now_iso()
-        duration = time.time() - self.t_start_epoch
+        duration = time.time() - float(self.t_start_epoch or time.time())
 
         row = SessionRow(
-            session_id=self.session_id,
-            timestamp_start=self.t_start_iso,
+            session_id=str(self.session_id),
+            timestamp_start=str(self.t_start_iso),
             timestamp_end=t_end_iso,
             duration_sec=round(duration, 3),
             song_index=int(self.selected_song_index),
@@ -1003,7 +1225,7 @@ class PracticeTracker(tk.Tk):
             bpm=int(self.locked_bpm),
             reps=int(self.reps),
             success=int(self.success),
-            note=self.note_var.get()
+            note=self.note_var.get(),
         )
 
         append_csv(SESSIONS_CSV, SESSIONS_FIELDS, asdict(row))
@@ -1015,7 +1237,6 @@ class PracticeTracker(tk.Tk):
             f"-> {SESSIONS_CSV}\n"
         )
 
-        # 練習中メトロノーム停止
         self.metro.stop()
         self.preview_btn.configure(text="試聴 ▶")
 
@@ -1065,7 +1286,6 @@ class PracticeTracker(tk.Tk):
 
 
 if __name__ == "__main__":
-    # 起動時に schema を整える（旧songs.csvを自動補完）
     ensure_songs_schema()
     ensure_sessions_schema()
 
